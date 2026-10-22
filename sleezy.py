@@ -72,18 +72,24 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
-# Enable VT100 ANSI sequences on Windows console
-if os.name == "nt":
-    os.system("")
 
 # Auto-detect readline / pyreadline3 for interactive shell tab completion
 HAVE_READLINE = False
+_readline_obj = None  # used only for pyreadline3 instance-based API
 try:
-    import pyreadline3 as readline
+    import pyreadline3 as _pyreadline3
+    _readline_obj = _pyreadline3.Readline()
+    # Expose module-level helpers via the instance so the rest of the code
+    # can call readline.set_completer / readline.parse_and_bind uniformly.
+    import types as _types
+    readline = _types.SimpleNamespace(
+        set_completer=_readline_obj.set_completer,
+        parse_and_bind=_readline_obj.parse_and_bind,
+    )
     HAVE_READLINE = True
-except ImportError:
+except (ImportError, Exception):
     try:
-        import readline
+        import readline  # type: ignore[no-redef]
         HAVE_READLINE = True
     except ImportError:
         HAVE_READLINE = False
@@ -133,30 +139,29 @@ class SleezyError(Exception):
 # Terminal UI & Styling Engine
 # =============================================================================
 class UI:
-    """Rich terminal styling engine with ANSI color and graceful fallback."""
-    USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    """Terminal UI engine (no color)."""
+    USE_COLOR = False
 
-    # ANSI styles
-    RESET = "\x1b[0m" if USE_COLOR else ""
-    BOLD = "\x1b[1m" if USE_COLOR else ""
-    ITALIC = "\x1b[3m" if USE_COLOR else ""
-    UNDERLINE = "\x1b[4m" if USE_COLOR else ""
-    DIM = "\x1b[2m" if USE_COLOR else ""
+    # All style/color codes are disabled
+    RESET = ""
+    BOLD = ""
+    ITALIC = ""
+    UNDERLINE = ""
+    DIM = ""
 
-    # ANSI 256 / 16 Colors
-    CYAN = "\x1b[38;5;51m" if USE_COLOR else ""
-    SKY = "\x1b[38;5;45m" if USE_COLOR else ""
-    BLUE = "\x1b[38;5;39m" if USE_COLOR else ""
-    PURPLE = "\x1b[38;5;141m" if USE_COLOR else ""
-    MAGENTA = "\x1b[38;5;201m" if USE_COLOR else ""
-    GREEN = "\x1b[38;5;48m" if USE_COLOR else ""
-    YELLOW = "\x1b[38;5;220m" if USE_COLOR else ""
-    ORANGE = "\x1b[38;5;208m" if USE_COLOR else ""
-    RED = "\x1b[38;5;196m" if USE_COLOR else ""
-    GRAY = "\x1b[38;5;244m" if USE_COLOR else ""
-    WHITE = "\x1b[38;5;255m" if USE_COLOR else ""
+    CYAN = ""
+    SKY = ""
+    BLUE = ""
+    PURPLE = ""
+    MAGENTA = ""
+    GREEN = ""
+    YELLOW = ""
+    ORANGE = ""
+    RED = ""
+    GRAY = ""
+    WHITE = ""
 
-    BANNER_GRADIENT = [CYAN, SKY, BLUE, PURPLE, MAGENTA, "\x1b[38;5;213m" if USE_COLOR else ""]
+    BANNER_GRADIENT = ["", "", "", "", "", ""]
 
     @classmethod
     def print_banner(cls):
@@ -1055,10 +1060,13 @@ def do_extract(stego_path: Path, out_dir: Path, passphrase: str, method_name: Op
 
         except SleezyError as e:
             last_err = e
-            if e.code != EXIT_NOTHING_FOUND:
-                best_err = e
+            if e.code == EXIT_AUTH_FAILED:
+                raise
             if not auto and method_name:
                 raise
+            if e.code not in (EXIT_NOTHING_FOUND, EXIT_UNSUPPORTED):
+                if best_err is None:
+                    best_err = e
             continue
         except Exception as e:
             last_err = SleezyError(f"{method.family}.{method.id}: {e}", EXIT_NOTHING_FOUND)
@@ -1068,7 +1076,7 @@ def do_extract(stego_path: Path, out_dir: Path, passphrase: str, method_name: Op
 
     if _internal_verify:
         raise SleezyError("verify: extraction failed", EXIT_VERIFY_FAILED)
-    raise best_err or last_err or SleezyError("Nothing detected: no method succeeded", EXIT_NOTHING_FOUND)
+    raise best_err or SleezyError("Nothing detected: no method succeeded", EXIT_NOTHING_FOUND)
 
 
 # =============================================================================
