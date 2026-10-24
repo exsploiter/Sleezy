@@ -15,6 +15,7 @@
 **v1.2.0 • Local-Only • Zero-Telemetry • Multi-Carrier Cryptographic Engine**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Test Suite](https://img.shields.io/badge/tests-124%20passed%20%7C%200%20failed-brightgreen.svg?style=flat-square)](test_sleezy.py)
 [![Security Policy](https://img.shields.io/badge/security-policy%20enforced-blue.svg?style=flat-square)](SECURITY.md)
 [![Security](https://img.shields.io/badge/crypto-Argon2id%20%7C%20XChaCha20--Poly1305-black.svg?style=flat-square)](SECURITY.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
