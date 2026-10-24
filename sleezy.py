@@ -658,11 +658,14 @@ class ImageLsbMethod(BitplaneMethod):
 
     def write_bit(self, carrier, idx: int, bit: int):
         r, col, ch, bit_pos = self._loc(carrier, idx)
-        val = carrier["arr"][r, col, ch]
-        carrier["arr"][r, col, ch] = (val & ~(1 << bit_pos)) | (bit << bit_pos)
+        val = int(carrier["arr"][r, col, ch])
+        carrier["arr"][r, col, ch] = (val & (0xFF ^ (1 << bit_pos))) | (bit << bit_pos)
 
     def save(self, carrier, out_path: Path):
-        Image.fromarray(carrier["arr"], mode="RGB").save(out_path)
+        save_kwargs = {}
+        if out_path.suffix.lower() == ".webp":
+            save_kwargs["lossless"] = True
+        Image.fromarray(carrier["arr"], mode="RGB").save(out_path, **save_kwargs)
 
 
 # ---- 2. Audio LSB (WAV 16-bit PCM) ------------------------------------------
@@ -1016,6 +1019,13 @@ def do_embed(carrier_path: Path, out_path: Path, payload_paths: list[Path], raw_
              time_cost: int = DEFAULT_TIME_COST, mem_cost_exp: int = DEFAULT_MEM_EXP,
              parallelism: int = DEFAULT_PARALLELISM) -> dict:
     """Executes the full pack -> compress -> encrypt -> scatter -> embed -> verify pipeline."""
+    default_name = f"{carrier_path.stem}_stego{carrier_path.suffix}"
+    if out_path.is_dir():
+        out_path = out_path / default_name
+    elif not out_path.suffix:
+        out_path = out_path.with_suffix(carrier_path.suffix)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     method = pick_method(carrier_path, method_name)
     if isinstance(method, ImageLsbMethod):
         method.bits = bits_per_channel
@@ -1545,14 +1555,19 @@ def run_wizard():
         default_out = carrier_path.with_name(f"{carrier_path.stem}_stego{carrier_path.suffix}")
         out_str = input(f"{UI.BOLD}Output file path [{default_out.name}]:{UI.RESET} ").strip().strip("'\"")
         out_path = Path(out_str) if out_str else default_out
+        if out_path.is_dir():
+            out_path = out_path / default_out.name
+        elif not out_path.suffix:
+            out_path = out_path.with_suffix(carrier_path.suffix)
 
         print(f"\n{UI.CYAN}Processing pipeline...{UI.RESET}")
         try:
             rep = do_embed(carrier_path, out_path, payload_paths, raw_text, pw, quiet=False)
+            final_out = rep.get("output", str(out_path))
             print()
-            UI.ok(f"Stego object successfully generated: {out_path}")
+            UI.ok(f"Stego object successfully generated: {final_out}")
             print(f"{UI.DIM}CLI Equivalent: sleezy embed -c \"{carrier_path}\" "
-                  f"{'-t ...' if raw_text else '-p ' + str(payload_paths[0])} -o \"{out_path}\"{UI.RESET}\n")
+                  f"{'-t ...' if raw_text else '-p ' + str(payload_paths[0])} -o \"{final_out}\"{UI.RESET}\n")
         except SleezyError as e:
             UI.err(str(e))
 
