@@ -711,6 +711,24 @@ def main():
                         "homo_bin.txt", "ex_homo_bin", "text.homoglyph")
         check("text.homoglyph round-trip (binary payload)", ok, detail)
 
+        # -- 41. Security & Hardening validations --------------------------
+        section("41. Security & Hardening validations")
+        # Profile directory traversal prevention
+        rc, _, _ = run("profile", "show", "../../etc/passwd")
+        check("profile show traversal blocked -> exit 2", rc == 2)
+        rc, _, _ = run("profile", "delete", "../../evil")
+        check("profile delete traversal blocked -> exit 2", rc == 2)
+
+        # Verify command nonexistent file check
+        rc, _, _ = run("verify", str(d / "does_not_exist.bin"))
+        check("verify nonexistent file -> exit 2", rc == 2)
+
+        # Keyfile pointing to a directory instead of a regular file
+        rc, _, _ = run("embed", "-c", str(d / "c64.png"), "-p", str(d / "secret.txt"),
+                       "-o", str(d / "kf_bad.png"), "--passphrase", "pw",
+                       "--keyfile", str(d), "--quiet", *FAST)
+        check("directory passed as keyfile -> exit 2", rc == 2)
+
     # -- summary ----------------------------------------------------------
     total = PASS_C + FAIL_C
     print(f"\n{'='*65}")

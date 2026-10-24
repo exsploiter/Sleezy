@@ -39,17 +39,20 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import hmac
 import io
 import json
 import math
 import mimetypes
 import os
 import random
+import re
 import secrets
 import shlex
 import struct
 import sys
 import tarfile
+import tempfile
 import time
 import wave
 import zipfile
@@ -331,6 +334,17 @@ class OuterHeader:
             raise SleezyError("Nothing detected: no Sleezy magic found", EXIT_NOTHING_FOUND)
         if cid not in CIPHERS or comp_id not in COMPRESSORS:
             raise SleezyError("Unsupported header (corrupt or unknown version)", EXIT_UNSUPPORTED)
+
+        # Defense against DoS via unreasonable Argon2 parameters or unbounded allocation
+        if tc < 1 or tc > 32:
+            raise SleezyError(f"Unsupported header: unreasonable KDF time cost ({tc})", EXIT_UNSUPPORTED)
+        if mce < 8 or mce > 24:
+            raise SleezyError(f"Unsupported header: unreasonable KDF memory cost exponent ({mce})", EXIT_UNSUPPORTED)
+        if par < 1 or par > 64:
+            raise SleezyError(f"Unsupported header: unreasonable KDF parallelism ({par})", EXIT_UNSUPPORTED)
+        if ctlen < 0 or ctlen > MAX_CIPHERTEXT_SIZE:
+            raise SleezyError(f"Unsupported header: ciphertext length ({ctlen}) exceeds maximum limit", EXIT_UNSUPPORTED)
+
         nonce_len = 12 if CIPHERS[cid] == "aes-256-gcm" else 24
         return OuterHeader(CIPHERS[cid], COMPRESSORS[comp_id], tc, mce, par, salt, nonce[:nonce_len], ctlen)
 
@@ -338,6 +352,11 @@ class OuterHeader:
 # =============================================================================
 # Crypto + compression + KDF (Keyfile support included)
 # =============================================================================
+MAX_CIPHERTEXT_SIZE = 16 * 1024 * 1024 * 1024  # 16 GiB practical upper bound
+MAX_DECOMPRESSED_SIZE = 2 * 1024 * 1024 * 1024  # 2 GiB decompression limit (anti-zip-bomb)
+MAX_MANIFEST_LEN = 10 * 1024 * 1024  # 10 MiB limit on container manifest
+
+
 def kdf_derive(passphrase: bytes, salt: bytes, time_cost: int, mem_cost_exp: int, parallelism: int) -> bytes:
     """Argon2id key derivation yielding 64 bytes (32B encryption key + 32B scatter seed)."""
     return hash_secret_raw(
@@ -348,12 +367,16 @@ def kdf_derive(passphrase: bytes, salt: bytes, time_cost: int, mem_cost_exp: int
 
 
 def prepare_secret(passphrase: str, keyfile_path: Optional[Path] = None) -> bytes:
-    """Combines passphrase with optional keyfile SHA-256 hash."""
+    """Combines passphrase with optional keyfile SHA-256 hash using streaming read."""
     secret = passphrase.encode("utf-8")
     if keyfile_path:
-        if not keyfile_path.exists():
-            raise SleezyError(f"Keyfile not found: {keyfile_path}", EXIT_BADARGS)
-        kf_hash = hashlib.sha256(keyfile_path.read_bytes()).digest()
+        if not keyfile_path.exists() or not keyfile_path.is_file():
+            raise SleezyError(f"Keyfile not found or not a regular file: {keyfile_path}", EXIT_BADARGS)
+        h = hashlib.sha256()
+        with open(keyfile_path, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        kf_hash = h.digest()
         secret = secret + b"::KEYFILE::" + kf_hash
     return secret
 
@@ -372,9 +395,21 @@ def decompress(data: bytes, algo: str) -> bytes:
     if algo == "zstd":
         if not HAVE_ZSTD:
             raise SleezyError("zstandard not installed, cannot decompress", EXIT_ERR)
-        return _zstd.ZstdDecompressor().decompress(data)
+        try:
+            return _zstd.ZstdDecompressor().decompress(data, max_output_size=MAX_DECOMPRESSED_SIZE)
+        except Exception as e:
+            raise SleezyError(f"Decompression failed: {e}", EXIT_ERR)
     if algo == "deflate":
-        return zlib.decompress(data)
+        try:
+            d = zlib.decompressobj()
+            out = d.decompress(data, MAX_DECOMPRESSED_SIZE)
+            if d.unconsumed_tail:
+                raise SleezyError("Decompression exceeded maximum allowed size (decompression bomb protection)", EXIT_ERR)
+            return out
+        except SleezyError:
+            raise
+        except Exception as e:
+            raise SleezyError(f"Decompression failed: {e}", EXIT_ERR)
     return data
 
 
@@ -442,25 +477,95 @@ def pack_container(payload_paths: list[Path], raw_text: Optional[str], watermark
     return struct.pack(">I", len(manifest_bytes)) + manifest_bytes + blob
 
 
+def _sanitize_filename(name: str) -> str:
+    """Sanitizes an untrusted filename from container manifest to prevent directory traversal."""
+    if not isinstance(name, str) or not name.strip():
+        return "payload.bin"
+    clean = name.replace("\\", "/").strip()
+    base = os.path.basename(clean)
+    base = base.replace("\x00", "")
+    if not base or base in (".", ".."):
+        return "payload.bin"
+    stem = base.split(".")[0].upper()
+    if stem in ("CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+                "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+                "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"):
+        base = f"safe_{base}"
+    return base
+
+
+def _safe_extract_tar(tar: tarfile.TarFile, target_dir: Path) -> None:
+    """Extracts tar archive safely preventing path traversal, symlink traversal, and device creation."""
+    target_dir_resolved = target_dir.resolve()
+    for member in tar.getmembers():
+        # Disallow character/block devices, fifos
+        if member.isdev() or member.ischr() or member.isblk() or member.isfifo():
+            raise SleezyError(f"Security error: dangerous file type in archive ({member.name})", EXIT_ERR)
+
+        # Disallow member paths with traversal or absolute targets
+        member_target = (target_dir / member.name).resolve()
+        if not member_target.is_relative_to(target_dir_resolved):
+            raise SleezyError(f"Security error: path traversal in archive member ({member.name})", EXIT_ERR)
+
+        # Disallow symlinks or hardlinks pointing outside the extraction directory
+        if member.issym() or member.islnk():
+            link_target = (member_target.parent / member.linkname).resolve()
+            if not link_target.is_relative_to(target_dir_resolved):
+                raise SleezyError(f"Security error: symlink traversal in archive ({member.name} -> {member.linkname})", EXIT_ERR)
+
+    try:
+        tar.extractall(target_dir, filter="data")
+    except (TypeError, AttributeError):
+        # Fallback for Python versions prior to 3.12 without filter argument
+        tar.extractall(target_dir)
+
+
 def unpack_container(blob: bytes, out_dir: Path) -> dict:
+    if len(blob) < 4:
+        raise SleezyError("Container corrupted: payload too short for container header", EXIT_VERIFY_FAILED)
     (mlen,) = struct.unpack(">I", blob[:4])
-    manifest = json.loads(blob[4:4 + mlen].decode("utf-8"))
+    if mlen <= 0 or mlen > MAX_MANIFEST_LEN or 4 + mlen > len(blob):
+        raise SleezyError("Container corrupted: invalid manifest size header", EXIT_VERIFY_FAILED)
+
+    try:
+        manifest = json.loads(blob[4:4 + mlen].decode("utf-8"))
+    except Exception as e:
+        raise SleezyError(f"Container corrupted: invalid manifest JSON ({e})", EXIT_VERIFY_FAILED)
+
+    if not isinstance(manifest, dict) or "files" not in manifest or not isinstance(manifest["files"], list) or not manifest["files"]:
+        raise SleezyError("Container corrupted: malformed manifest structure", EXIT_VERIFY_FAILED)
+
     payload = blob[4 + mlen:]
     info = manifest["files"][0]
+    if not isinstance(info, dict) or "sha256" not in info or "name" not in info:
+        raise SleezyError("Container corrupted: missing file metadata in manifest", EXIT_VERIFY_FAILED)
+
     actual_hash = hashlib.sha256(payload).hexdigest()
-    integrity_ok = actual_hash == info["sha256"]
+    integrity_ok = hmac.compare_digest(actual_hash.lower(), str(info["sha256"]).lower())
     out_dir.mkdir(parents=True, exist_ok=True)
-    if manifest["mode"] == "text":
-        (out_dir / info["name"]).write_text(payload.decode("utf-8"), encoding="utf-8")
-        result_path = str(out_dir / info["name"])
-    elif manifest["mode"] == "tar":
+    out_dir_resolved = out_dir.resolve()
+
+    mode = manifest.get("mode", "single")
+    if mode == "text":
+        safe_name = _sanitize_filename(info["name"])
+        target = (out_dir / safe_name).resolve()
+        if not target.is_relative_to(out_dir_resolved):
+            raise SleezyError("Security error: detected directory traversal in payload filename", EXIT_ERR)
+        target.write_text(payload.decode("utf-8", errors="replace"), encoding="utf-8")
+        result_path = str(target)
+    elif mode == "tar":
         buf = io.BytesIO(payload)
         with tarfile.open(fileobj=buf, mode="r") as tar:
-            tar.extractall(out_dir, filter="data")
+            _safe_extract_tar(tar, out_dir)
         result_path = str(out_dir)
     else:
-        (out_dir / info["name"]).write_bytes(payload)
-        result_path = str(out_dir / info["name"])
+        safe_name = _sanitize_filename(info["name"])
+        target = (out_dir / safe_name).resolve()
+        if not target.is_relative_to(out_dir_resolved):
+            raise SleezyError("Security error: detected directory traversal in payload filename", EXIT_ERR)
+        target.write_bytes(payload)
+        result_path = str(target)
+
     return {
         "manifest": manifest,
         "integrity_ok": integrity_ok,
@@ -802,7 +907,11 @@ class GenericAppendMethod(BlobMethod):
         if idx == -1:
             raise SleezyError("Nothing detected: no Sleezy trailer found", EXIT_NOTHING_FOUND)
         off = idx + len(TRAILER_MAGIC)
+        if len(data) < off + 8:
+            raise SleezyError("Trailer truncated/corrupt: missing length header", EXIT_ERR)
         (blen,) = struct.unpack(">Q", data[off:off + 8])
+        if blen > len(data) or off + 8 + blen > len(data):
+            raise SleezyError("Trailer truncated/corrupt: payload shorter than specified", EXIT_ERR)
         blob = data[off + 8:off + 8 + blen]
         if len(blob) != blen:
             raise SleezyError("Trailer truncated/corrupt", EXIT_ERR)
@@ -903,7 +1012,9 @@ def _bits_to_bytes(bits: list[int]) -> bytes:
 def do_embed(carrier_path: Path, out_path: Path, payload_paths: list[Path], raw_text: Optional[str],
              passphrase: str, method_name: Optional[str] = None, cipher: str = "xchacha20poly1305",
              compress_algo: str = "zstd", keyfile: Optional[Path] = None, watermark: Optional[str] = None,
-             bits_per_channel: int = 1, dry_run: bool = False, quiet: bool = False) -> dict:
+             bits_per_channel: int = 1, dry_run: bool = False, quiet: bool = False,
+             time_cost: int = DEFAULT_TIME_COST, mem_cost_exp: int = DEFAULT_MEM_EXP,
+             parallelism: int = DEFAULT_PARALLELISM) -> dict:
     """Executes the full pack -> compress -> encrypt -> scatter -> embed -> verify pipeline."""
     method = pick_method(carrier_path, method_name)
     if isinstance(method, ImageLsbMethod):
@@ -916,15 +1027,15 @@ def do_embed(carrier_path: Path, out_path: Path, payload_paths: list[Path], raw_
 
     salt = secrets.token_bytes(16)
     secret = prepare_secret(passphrase, keyfile)
-    km = kdf_derive(secret, salt, DEFAULT_TIME_COST, DEFAULT_MEM_EXP, DEFAULT_PARALLELISM)
+    km = kdf_derive(secret, salt, time_cost, mem_cost_exp, parallelism)
     enc_key, scatter_seed = km[:32], km[32:64]
 
     nonce_len = 12 if cipher == "aes-256-gcm" else 24
     nonce = secrets.token_bytes(nonce_len)
     ciphertext = encrypt(comp, enc_key, nonce, cipher)
 
-    header = OuterHeader(cipher, actual_compress, DEFAULT_TIME_COST, DEFAULT_MEM_EXP,
-                         DEFAULT_PARALLELISM, salt, nonce, len(ciphertext))
+    header = OuterHeader(cipher, actual_compress, time_cost, mem_cost_exp,
+                         parallelism, salt, nonce, len(ciphertext))
     header_bytes = header.pack()
 
     if method.mode == "blob":
@@ -984,19 +1095,15 @@ def do_embed(carrier_path: Path, out_path: Path, payload_paths: list[Path], raw_
             method.write_bit(carrier, pos, bit)
         method.save(carrier, out_path)
 
-    # ---- Verify Step: Re-extract in memory before declaring success ----------
-    verify_dir = out_path.parent / f".sleezy_verify_{secrets.token_hex(4)}"
-    try:
+    # ---- Verify Step: Re-extract in secure tempdir before declaring success --
+    with tempfile.TemporaryDirectory(prefix="sleezy_verify_") as tmp_dir:
         extracted = do_extract(
-            out_path, verify_dir, passphrase, method_name=f"{method.family}.{method.id}",
+            out_path, Path(tmp_dir), passphrase, method_name=f"{method.family}.{method.id}",
             keyfile=keyfile, quiet=True, _internal_verify=True
         )
         if not extracted.get("integrity_ok", False):
             out_path.unlink(missing_ok=True)
             raise SleezyError("Verification failed after embed (hash mismatch)", EXIT_VERIFY_FAILED)
-    finally:
-        import shutil
-        shutil.rmtree(verify_dir, ignore_errors=True)
 
     report["output"] = str(out_path)
     if not quiet:
@@ -1020,6 +1127,10 @@ def do_extract(stego_path: Path, out_dir: Path, passphrase: str, method_name: Op
                 full = method.extract_blob(stego_path)
                 header = OuterHeader.unpack(full)
                 ciphertext = full[HEADER_SIZE:HEADER_SIZE + header.ciphertext_len]
+                secret = prepare_secret(passphrase, keyfile)
+                km = kdf_derive(secret, header.salt, header.time_cost,
+                                header.mem_cost_exp, header.parallelism)
+                enc_key = km[:32]
             else:
                 carrier = method.load(stego_path)
                 capacity = method.capacity_bits(carrier)
@@ -1031,15 +1142,11 @@ def do_extract(stego_path: Path, out_dir: Path, passphrase: str, method_name: Op
                 secret = prepare_secret(passphrase, keyfile)
                 km = kdf_derive(secret, header.salt, header.time_cost,
                                 header.mem_cost_exp, header.parallelism)
-                scatter_seed = km[32:64]
+                enc_key, scatter_seed = km[:32], km[32:64]
                 positions = _scatter_positions(scatter_seed, HEADER_BITS, capacity, header.ciphertext_len * 8)
                 cipher_bits = [method.read_bit(carrier, p) for p in positions]
                 ciphertext = _bits_to_bytes(cipher_bits)
 
-            secret = prepare_secret(passphrase, keyfile)
-            km = kdf_derive(secret, header.salt, header.time_cost,
-                            header.mem_cost_exp, header.parallelism)
-            enc_key = km[:32]
             comp = decrypt(ciphertext, enc_key, header.nonce, header.cipher)
             inner = decompress(comp, header.compress)
             result = unpack_container(inner, out_dir)
@@ -1279,10 +1386,21 @@ def get_profile_dir() -> Path:
     return p
 
 
+PROFILE_NAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _validate_profile_name(name: str) -> None:
+    if not name or not PROFILE_NAME_REGEX.match(name):
+        raise SleezyError(f"Invalid profile name: '{name}'. Only alphanumeric characters, dashes, and underscores allowed.", EXIT_BADARGS)
+
+
 def load_profile(name: str) -> dict:
     if name in DEFAULT_PROFILES:
         return DEFAULT_PROFILES[name]
-    custom_path = get_profile_dir() / f"{name}.json"
+    _validate_profile_name(name)
+    custom_path = (get_profile_dir() / f"{name}.json").resolve()
+    if not custom_path.is_relative_to(get_profile_dir().resolve()):
+        raise SleezyError(f"Profile path traversal detected: '{name}'", EXIT_BADARGS)
     if custom_path.exists():
         return json.loads(custom_path.read_text(encoding="utf-8"))
     raise SleezyError(f"Profile '{name}' not found", EXIT_BADARGS)
@@ -1312,7 +1430,10 @@ def do_profile(action: str, name: Optional[str] = None, output: Optional[Path] =
             raise SleezyError("Specify profile name to delete", EXIT_BADARGS)
         if name in DEFAULT_PROFILES:
             raise SleezyError("Cannot delete built-in profile", EXIT_BADARGS)
-        target = p_dir / f"{name}.json"
+        _validate_profile_name(name)
+        target = (p_dir / f"{name}.json").resolve()
+        if not target.is_relative_to(p_dir.resolve()):
+            raise SleezyError("Profile path traversal detected", EXIT_BADARGS)
         if target.exists():
             target.unlink()
             UI.ok(f"Deleted profile: {name}")
@@ -1680,12 +1801,18 @@ def execute_cli_args(args: argparse.Namespace) -> int:
         cipher = args.cipher
         compress_algo = args.compress
         bits = args.bits
+        time_cost = DEFAULT_TIME_COST
+        mem_cost_exp = DEFAULT_MEM_EXP
+        parallelism = DEFAULT_PARALLELISM
 
         if args.profile:
             prof = load_profile(args.profile)
             cipher = prof.get("cipher", cipher)
             compress_algo = prof.get("compress", compress_algo)
             bits = prof.get("bits", bits)
+            time_cost = prof.get("time_cost", time_cost)
+            mem_cost_exp = prof.get("mem_cost_exp", mem_cost_exp)
+            parallelism = prof.get("parallelism", parallelism)
             if "method" in prof and not args.method:
                 args.method = prof["method"]
 
@@ -1695,16 +1822,19 @@ def execute_cli_args(args: argparse.Namespace) -> int:
             _get_passphrase(args.passphrase), method_name=args.method,
             cipher=cipher, compress_algo=compress_algo, keyfile=args.keyfile,
             watermark=args.watermark, bits_per_channel=bits,
-            dry_run=args.dry_run, quiet=args.quiet
+            dry_run=args.dry_run, quiet=args.quiet,
+            time_cost=time_cost, mem_cost_exp=mem_cost_exp, parallelism=parallelism
         )
         return EXIT_OK
 
     if args.command == "extract":
-        do_extract(
+        res = do_extract(
             args.stego, args.output_dir, _get_passphrase(args.passphrase),
             method_name=args.method, keyfile=args.keyfile,
             auto=args.auto or not args.method, quiet=args.quiet
         )
+        if not res.get("integrity_ok", False):
+            raise SleezyError("Extraction payload integrity check failed (SHA-256 mismatch)", EXIT_VERIFY_FAILED)
         return EXIT_OK
 
     if args.command == "analyze":
@@ -1764,10 +1894,12 @@ def execute_cli_args(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if args.command == "verify":
+        if not args.file.exists():
+            raise SleezyError(f"File not found: {args.file}", EXIT_BADARGS)
         h = hashlib.sha256(args.file.read_bytes()).hexdigest()
         print(h)
         if args.hash:
-            ok = h.lower() == args.hash.lower()
+            ok = hmac.compare_digest(h.lower(), args.hash.strip().lower())
             print("MATCH" if ok else "MISMATCH")
             return EXIT_OK if ok else EXIT_ERR
         return EXIT_OK

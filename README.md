@@ -16,7 +16,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![PRD Spec](https://img.shields.io/badge/PRD%20Spec-v1.0%20Draft-blueviolet.svg?style=flat-square)](Sleezy%20%E2%80%93%20Product%20Requirements%20Document%201.md)
-[![Test Suite](https://img.shields.io/badge/tests-23%20passed%20%7C%200%20failed-brightgreen.svg?style=flat-square)](test_sleezy.py)
+[![Test Suite](https://img.shields.io/badge/tests-124%20passed%20%7C%200%20failed-brightgreen.svg?style=flat-square)](test_sleezy.py)
 [![Security](https://img.shields.io/badge/crypto-Argon2id%20%7C%20XChaCha20--Poly1305-black.svg?style=flat-square)](sleezy.py)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
@@ -28,6 +28,7 @@
 [Interactive CLI](#-interactive-terminal-workbench) •
 [Steganalysis](#-steganalysis-engine) •
 [Profiles](#-profile-presets) •
+[Security Hardening](#-security-hardening) •
 [Test Suite](#-automated-testing)
 
 </div>
@@ -42,6 +43,7 @@ Existing steganography utilities generally fall into two extremes: command-line 
 - **One Engine, Many Carriers**: Every carrier format and embedding algorithm operates as a plugin behind a unified, authenticated pipeline.
 - **Privacy by Default**: 100% local processing. No telemetry, no cloud dependencies, and zero network calls.
 - **Defense in Depth**: Authenticated encryption (`XChaCha20-Poly1305` or `AES-256-GCM`), memory-hard key derivation (`Argon2id`), and keyed PRNG scatter positions defeat sequential statistical detectors.
+- **Hardened Container Security**: Built-in protection against path traversal, zip/tar-slip, decompression bombs, and timing attacks on digest comparisons.
 - **Dual-Mode Steganalysis & Integrity**: Includes an advanced analytical engine featuring Chi-Square ($\chi^2$) PoV analysis, Shannon sliding block entropy, LSB ratio deviation, and 2D ASCII bitplane density heatmaps.
 - **Fail-Safe Self-Verification**: Every embed operation automatically executes an immediate in-memory re-extraction and SHA-256 checksum verification before the output file is written to disk.
 
@@ -326,6 +328,20 @@ Use `--profile <name>` to instantly configure pipeline parameters:
 | `max-capacity`| XChaCha20-Poly1305 | Zstd-12 | 64 MiB, 3 iter | 4 bits | Maximum payload storage |
 | `watermark` | AES-256-GCM | Zstd-12 | 32 MiB, 2 iter | 1 bit | Provenance metadata tags |
 | `covert-text` | XChaCha20-Poly1305 | Zstd-12 | 64 MiB, 3 iter | Homoglyphs | Invisible plain text hiding |
+
+---
+
+## 🛡️ Security Hardening
+
+Sleezy incorporates comprehensive security controls designed to resist attacks from adversarial carriers and malformed stego objects:
+
+1. **Path Traversal & Tar-Slip Defense**: All extracted payload filenames are strictly sanitized to strip directory traversal sequences (`..`), leading slashes, and reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`). Tar members are validated to guarantee no paths or symlinks escape the destination directory.
+2. **Anti-DoS KDF Bounds**: The outer header unpacker enforces sanity checks on Argon2 parameters (`time_cost` $\le$ 32, memory exponent $\le$ 24, parallelism $\le$ 64) to prevent adversarial CPU/RAM exhaustion attacks during extraction.
+3. **Decompression Bomb Protection**: Both `deflate` and `zstandard` decompression engines enforce strict 2 GiB output bounds (`max_length` and `max_output_size`), defending against memory explosion attacks.
+4. **Side-Channel Resistant Comparisons**: All checksum verifications and container manifest integrity checks use constant-time `hmac.compare_digest` to prevent timing leak vulnerabilities.
+5. **Profile Injection Prevention**: Custom profile names are validated using strict alphanumeric patterns (`^[a-zA-Z0-9_\-]+$`), completely blocking arbitrary file access or deletion via profile flags.
+6. **Isolated Ephemeral Verification**: Self-verification occurs inside isolated OS temporary directories (`tempfile.TemporaryDirectory`) rather than writing unencrypted temporary files to user working paths.
+7. **Stream-Hashed Keyfiles**: Keyfiles are hashed using fixed 64 KiB chunks, enabling arbitrary keyfile sizes without risk of out-of-memory crashes.
 
 ---
 
