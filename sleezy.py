@@ -206,12 +206,13 @@ class UI:
     def box(cls, title: str, lines: list[str], color: str = ""):
         color = color or cls.CYAN
         content_plain_lengths = [len(cls._strip_ansi(l)) for l in lines]
-        width = max([len(title) + 4] + content_plain_lengths + [55])
-        border_top = f"┌─ {title} " + "─" * (width - len(title) - 4) + "┐"
-        border_bottom = "└" + "─" * (width - 1) + "┘"
+        # inner width = widest content line + 1 space of padding on each side
+        inner = max([len(title) + 3] + [n + 2 for n in content_plain_lengths] + [55])
+        border_top = "┌─ " + title + " " + "─" * (inner - len(title) - 3) + "┐"
+        border_bottom = "└" + "─" * inner + "┘"
         print(f"{color}{border_top}{cls.RESET}")
         for l in lines:
-            pad = width - 2 - len(cls._strip_ansi(l))
+            pad = inner - 1 - len(cls._strip_ansi(l))
             print(f"{color}│{cls.RESET} {l}" + " " * max(pad, 0) + f"{color}│{cls.RESET}")
         print(f"{color}{border_bottom}{cls.RESET}")
 
